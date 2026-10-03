@@ -20,8 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .eh_frame import (
-    EHFrameError, MAX_SECTION_SIZE, analyze, parse_section, reg_name,
-    parse_reg_number,
+    EHFrameError, MAX_SECTION_SIZE, MAX_UNWIND_FRAMES, MIN_UNWIND_FRAMES,
+    analyze, parse_section, reg_name, parse_reg_number, unwind,
 )
 from . import samplegen
 
@@ -82,6 +82,30 @@ def _coerce_int(val) -> int:
     return _parse_int(str(val), "数值")
 
 
+def _wants_unwind(payload: dict) -> bool:
+    """True when the request asks for a continuous backtrace."""
+    val = payload.get("unwind")
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_max_frames(payload: dict) -> int:
+    raw = payload.get("max_frames")
+    if raw is None:
+        raise ValueError("连续回溯需要 max_frames 字段（%d–%d 帧上限）"
+                         % (MIN_UNWIND_FRAMES, MAX_UNWIND_FRAMES))
+    n = _coerce_int(raw)
+    if n < MIN_UNWIND_FRAMES or n > MAX_UNWIND_FRAMES:
+        raise ValueError("帧上限 max_frames 必须在 %d–%d 之间，得到 %d"
+                         % (MIN_UNWIND_FRAMES, MAX_UNWIND_FRAMES, n))
+    return n
+
+
 def build_response(payload: dict) -> dict:
     """Pure transformation: request dict -> response dict (raises)."""
     raw = _b64_decode(payload.get("section_base64", ""))
@@ -108,15 +132,26 @@ def build_response(payload: dict) -> dict:
             mem_in[_parse_int(key, "内存地址")] = _parse_int(val, "内存值")
 
     section = parse_section(raw)
+
+    if _wants_unwind(payload):
+        ures = unwind(section, pc, regs_in, mem_in,
+                      _parse_max_frames(payload))
+        return _unwind_conclusion(ures, pc)
+
     result = analyze(section, pc, regs_in, mem_in)
 
     if not result.hit:
         return {"hit": False, "pc": pc, "miss_reason": result.miss_reason}
 
-    fde, cie, row = result.fde, result.cie, result.matched_row
+    response = {"hit": True, "pc": pc}
+    response.update(_hit_conclusion(result))
+    return response
+
+
+def _hit_conclusion(result) -> dict:
+    """Serialize a successful single-frame AnalysisResult."""
+    fde, cie = result.fde, result.cie
     return {
-        "hit": True,
-        "pc": pc,
         "fde": {
             "length_field_offset": fde.offset,
             "cie_pointer_field_offset": fde.pointer_field_offset,
@@ -183,6 +218,34 @@ def build_response(payload: dict) -> dict:
                 for num, rule in sorted(row.regs.items())
             ],
         } for row in result.timeline],
+    }
+
+
+def _unwind_conclusion(ures, pc: int) -> dict:
+    """Serialize a continuous-backtrace UnwindResult."""
+    if not ures.hit:
+        # First-frame miss keeps the single-frame miss semantics.
+        return {"hit": False, "unwind": True, "pc": pc,
+                "miss_reason": ures.miss_reason}
+    frames = []
+    for fr in ures.frames:
+        entry = {
+            "index": fr.index,
+            "pc": fr.pc,
+            "input_registers": [
+                {"number": n, "name": reg_name(n), "value": v}
+                for n, v in sorted(fr.registers.items())],
+        }
+        entry.update(_hit_conclusion(fr.result))
+        frames.append(entry)
+    return {
+        "hit": True,
+        "unwind": True,
+        "pc": pc,
+        "max_frames": ures.max_frames,
+        "frame_count": len(frames),
+        "stop": {"kind": ures.stop_kind, "reason": ures.stop_reason},
+        "frames": frames,
     }
 
 
@@ -267,8 +330,12 @@ class _Handler(BaseHTTPRequestHandler):
             response = build_response(payload)
         except EHFrameError as exc:
             # Anchor the first raw section offset; never partial output.
-            self._send_json(422, {"error": exc.message,
-                                  "offset": exc.offset})
+            # A continuous-backtrace failure also names the failing
+            # frame — the whole chain is discarded, never partial.
+            body = {"error": exc.message, "offset": exc.offset}
+            if exc.frame is not None:
+                body["frame"] = exc.frame
+            self._send_json(422, body)
             return
         except (ValueError, KeyError) as exc:
             self._send_json(400, {"error": str(exc)})

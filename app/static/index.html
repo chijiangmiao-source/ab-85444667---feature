@@ -109,6 +109,18 @@ r12=0x222</textarea>
 0x7fffe8=0x333
 0x7fffe0=0x444</textarea>
       <div class="hint">CFA 计算或 offset 恢复若读取未提供的地址，将按越界报错且不返回任何寄存器结果。</div>
+      <div class="row" style="align-items:flex-end">
+        <div style="flex:1;min-width:200px">
+          <label for="unwind" style="color:var(--text);margin-top:10px">
+            <input type="checkbox" id="unwind"> 连续回溯（逐帧展开调用者）</label>
+        </div>
+        <div style="flex:0 0 150px;min-width:130px">
+          <label for="maxframes">帧上限（2–16）</label>
+          <input type="text" id="maxframes" value="8">
+        </div>
+      </div>
+      <div class="hint">连续回溯先按既有规则归约当前帧，再仅以该帧恢复出的寄存器与调用者
+        PC 作为下一帧输入；任一后续帧失败将丢弃整条链路并定位失败帧。</div>
       <button id="go">分析 / Analyze</button>
       <button id="sample" class="secondary">载入示例（含 remember/restore）</button>
       <button id="clear" class="secondary">清空结论</button>
@@ -157,6 +169,14 @@ r12=0x222</textarea>
       </div>
     </div>
 
+    <div id="unwind-result" hidden>
+      <div class="card">
+        <h2>连续回溯 · 终止原因</h2>
+        <dl class="kv" id="kv-stop"></dl>
+      </div>
+      <div id="frames"></div>
+    </div>
+
     <div id="errorbox" class="card" hidden>
       <h2>解析 / 归约失败</h2>
       <div class="errbox" id="errtext"></div>
@@ -177,6 +197,7 @@ function setStatus(kind, msg){
 }
 function clearResult(){
   $("result").hidden = true; $("errorbox").hidden = true;
+  $("unwind-result").hidden = true;
   setStatus(null,"");
 }
 
@@ -269,6 +290,95 @@ function render(data){
   $("result").hidden=false;
 }
 
+// --- continuous backtrace rendering ---------------------------------------
+const STOP_KINDS = {
+  tail_miss:   "正常链尾（调用者 PC 未命中 FDE）",
+  no_progress: "PC 未推进",
+  repeat_state:"重复调用状态（循环）",
+  frame_limit: "达到帧上限",
+};
+
+function frameCard(fr){
+  const f=fr.fde, c=fr.cie;
+  const card=document.createElement("div"); card.className="card";
+  const inRegs=(fr.input_registers||[])
+    .map(r=>r.name+"="+hex(r.value)).join("  ")||"（无）";
+  const regRows=fr.registers.map(r=>{
+    const badge = r.rule_kind==="undefined"
+      ? "<span class='badge b-und'>undefined</span>"
+      : (r.recoverable ? "<span class='badge b-ok'>可恢复</span>"
+                       : "<span class='badge b-no'>不可恢复</span>");
+    return "<tr><td>"+r.name+
+      " <span style='color:var(--muted)'>#"+r.number+"</span></td>"+
+      "<td>"+r.rule+"</td>"+
+      "<td class='num'>"+hex(r.origin_offset)+"</td>"+
+      "<td class='num'>"+(r.value==null?"—":hex(r.value))+" "+badge+"</td>"+
+      "<td>"+r.reason+"</td></tr>";
+  }).join("");
+  const memRows=fr.memory_reads.map(m=>
+    "<tr><td class='num'>"+hex(m.address)+"</td>"+
+    "<td class='num'>"+hex(m.value)+"</td></tr>").join("");
+  const tlRows=fr.timeline.map(row=>{
+    const regs=(row.regs||[]).map(v=>{
+      const extra = v.kind==="offset"
+        ? " → [CFA"+(v.byte_offset>=0?"+":"")+v.byte_offset+"]"
+        : v.kind==="register" ? " → "+v.operand_register : "";
+      return "<b>"+v.register+"</b> = "+v.kind+extra;
+    }).join("<br>");
+    const hl=row.fde_relative_location===fr.matched_row.fde_relative_location;
+    return "<tr"+(hl?" style='outline:1px solid var(--accent)'":"")+">"+
+      "<td class='num'>"+hex(row.fde_relative_location)+
+      "<br><span style='color:var(--muted)'>"+hex(row.absolute_location_start)+
+      "</span></td><td>"+(row.cfa||"—")+"</td>"+
+      "<td>"+(regs||"（仅初始规则）")+"</td></tr>";
+  }).join("");
+  card.innerHTML=
+    "<h2>帧 #"+fr.index+" · PC "+hex(fr.pc)+"</h2>"+
+    "<dl class='kv'>"+
+    "<dt>命中 FDE</dt><dd>raw "+hex(f.length_field_offset)+"，范围 ["+
+      hex(f.initial_location)+", "+hex(f.end_address)+")</dd>"+
+    "<dt>关联 CIE</dt><dd>"+hex(c.length_field_offset)+
+      "（返回地址列 "+c.return_address_register+"）</dd>"+
+    "<dt>命中行相对位置</dt><dd>"+hex(fr.matched_row.fde_relative_location)+"</dd>"+
+    "<dt>CFA</dt><dd>"+fr.cfa.rule+" ⇒ "+hex(fr.cfa.value)+"</dd>"+
+    "<dt>调用者 PC</dt><dd>"+(fr.caller_pc==null
+        ? "<span class='badge b-und'>不可恢复</span>"
+        : hex(fr.caller_pc)+"（"+fr.caller_pc_rule+"）")+"</dd>"+
+    "<dt>本帧输入寄存器</dt><dd>"+inRegs+"</dd>"+
+    "</dl>"+
+    "<details open><summary>寄存器恢复规则与取值（"+fr.registers.length+"）</summary>"+
+      "<table><thead><tr><th>寄存器</th><th>规则</th><th>规则来源偏移</th>"+
+      "<th>恢复值</th><th>说明</th></tr></thead><tbody>"+regRows+
+      "</tbody></table></details>"+
+    "<details><summary>所用内存读取（"+fr.memory_reads.length+"）</summary>"+
+      "<table><thead><tr><th>地址</th><th>8 字节值</th></tr></thead><tbody>"+
+      memRows+"</tbody></table></details>"+
+    "<details><summary>逐地址归约时间线（"+fr.timeline.length+" 行）</summary>"+
+      "<div class='timeline-wrap'><table><thead><tr><th>FDE 相对位置</th>"+
+      "<th>CFA</th><th>寄存器规则</th></tr></thead><tbody>"+tlRows+
+      "</tbody></table></div></details>";
+  return card;
+}
+
+function renderUnwind(data){
+  clearResult();
+  if(!data.hit){
+    setStatus("miss","未命中：" + data.miss_reason);
+    return; // 首帧未命中：与单帧语义一致，不保留任何上次结论
+  }
+  setStatus("ok","连续回溯完成："+data.frame_count+" 帧（上限 "+
+    data.max_frames+"）");
+  kv($("kv-stop"), [
+    ["终止类别", (STOP_KINDS[data.stop.kind]||data.stop.kind)+
+      " <span style='color:var(--muted)'>("+data.stop.kind+")</span>"],
+    ["终止原因", data.stop.reason],
+    ["帧数 / 上限", data.frame_count+" / "+data.max_frames],
+  ]);
+  const host=$("frames"); host.innerHTML="";
+  data.frames.forEach(fr=>host.appendChild(frameCard(fr)));
+  $("unwind-result").hidden=false;
+}
+
 async function analyze(){
   const payload={
     section_base64:$("section").value,
@@ -276,6 +386,10 @@ async function analyze(){
     registers_text:$("regs").value,
     memory_text:$("mem").value,
   };
+  if($("unwind").checked){
+    payload.unwind=true;
+    payload.max_frames=$("maxframes").value.trim();
+  }
   setStatus(null,"");
   let resp;
   try{
@@ -287,10 +401,12 @@ async function analyze(){
     $("errtext").textContent="网络错误："+e; setStatus("err","请求失败"); return;
   }
   let data; try{ data=await resp.json(); }catch(e){ data={error:"非 JSON 响应"}; }
-  if(resp.ok){ render(data); return; }
+  if(resp.ok){ if(data.unwind) renderUnwind(data); else render(data); return; }
   clearResult();
   $("errorbox").hidden=false;
-  $("errtext").textContent = data.error +
+  $("errtext").textContent =
+    (data.frame!=null ? "连续回溯失败帧：#"+data.frame+"\n" : "") +
+    data.error +
     (data.offset!=null ? "\n首个原始偏移：0x"+data.offset.toString(16)+
       " ("+data.offset+")" : "");
   if(resp.status===422) setStatus("err","解析/归约被拒绝（422）");

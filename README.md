@@ -41,6 +41,31 @@ expression 规则等。出现这些情况会在**首个原始偏移**处明确�
    （返回地址列无规则或为 undefined），都在首个原始偏移处整体拒绝，
    绝不返回部分寄存器结果。
 
+## 连续回溯（多帧展开）
+
+在页面勾选**连续回溯**并填写 **2–16** 的帧上限后，系统以同一份
+`.eh_frame`、寄存器和内存快照逐帧取得调用者：
+
+1. **首帧按既有单帧规则归约**当前 PC（命中/未命中/拒绝语义完全不变）；
+2. 每一后续帧**仅以**上一帧恢复出的寄存器值与调用者 PC（写入返回地址列）
+   作为输入，不复用用户最初提供的寄存器；
+3. 逐帧返回命中的 FDE、关联 CIE、CFA 规则与取值、调用者 PC、各寄存器
+   恢复规则（含原始节偏移）及该帧所用的内存读取。
+
+**终止原因（均保留此前全部完整帧）**：
+
+| `stop.kind` | 含义 |
+| --- | --- |
+| `tail_miss` | 调用者 PC 未命中任何 FDE：正常链尾 |
+| `no_progress` | 调用者 PC 与本帧 PC 相同，PC 未推进 |
+| `repeat_state` | （PC + 全部输入寄存器）调用状态重复：循环 |
+| `frame_limit` | 达到用户填写的帧上限 |
+
+**失败语义**：任一**后续帧**出现内存越界、调用者不可恢复或格式错误时，
+整条连续回溯不得返回部分链路——响应为 422，额外携带 `frame`（失败帧
+序号）与既有 `offset`（首个原始节偏移），且不含 `frames`。首帧自身的
+失败或未命中保持原有单帧语义（422 无帧标记 / 200 `hit=false`）。
+
 > 由于 `.eh_frame` 的 CIE 标记字也是 `0`，而本系统又接受指向节偏移 0
 > 处 CIE 的绝对指针 `0`，解析器通过**结构性探测**消歧：节中第一条记录
 > 必须是 CIE；其后 id 为 0 的记录，仅当字节能构成合法 CIE 头
@@ -64,8 +89,10 @@ curl -s http://localhost:8080/healthz
 ## 验收 verify（Compose 内对真实接口执行）
 
 `verify` 在 Compose 内：构建检查（字节码编译）、对有效嵌套规则 /
-恢复回退 / 截断 FDE 执行代码测试，并以有效及失败输入完成 API/HTTP
-冒烟后退出，**用退出码报告验收结果**（0 全部通过，1 存在失败）：
+恢复回退 / 截断 FDE 执行代码测试、连续回溯（有效多帧链、正常未命中
+链尾、循环与帧上限终止、后续帧失败清空链路）代码测试，并以有效及
+失败输入完成 API/HTTP 冒烟后退出，**用退出码报告验收结果**
+（0 全部通过，1 存在失败）：
 
 ```bash
 docker compose up -d --build web
@@ -118,6 +145,22 @@ timeline`；未命中返回 200 且仅 `hit=false + miss_reason`；
 
 `offset` 即检测到的首个原始节字节偏移，且错误响应不含寄存器结果。
 
+**连续回溯**：请求附加 `"unwind": true` 与 `"max_frames": 2..16`
+（缺省或越界返回 400）。命中时返回 200：
+
+```json
+{"hit": true, "unwind": true, "max_frames": 8, "frame_count": 3,
+ "stop": {"kind": "tail_miss", "reason": "..."},
+ "frames": [{"index": 0, "pc": "...", "input_registers": [...],
+             "fde": ..., "cfa": ..., "caller_pc": ...,
+             "registers": [...], "memory_reads": [...],
+             "timeline": [...]}, ...]}
+```
+
+每个 `frames[]` 元素与单帧命中结论同构，另含帧序号、本帧 PC 与本帧
+实际输入寄存器。后续帧失败返回 422 且含 `frame`（失败帧序号）与
+`offset`，不含 `frames`。
+
 ## 目录
 
 ```
@@ -125,7 +168,8 @@ app/
   eh_frame.py    严格解析器 + CFI 抽象机 + 逐地址规则归约与状态恢复
   server.py      标准库 HTTP 服务（页面 / healthz / api/analyze）
   static/index.html  值班页面
-  samplegen.py   确定性合成 .eh_frame（含 remember/restore 与各类畸形样例）
+  samplegen.py   确定性合成 .eh_frame（含 remember/restore、rbp 链式
+                 连续回溯样例与各类畸形样例）
   verify.py      构建检查 + 引擎代码测试 + API/HTTP 冒烟，退出码报告
 Dockerfile
 docker-compose.yml

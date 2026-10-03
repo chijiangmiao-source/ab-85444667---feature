@@ -225,3 +225,96 @@ def all_failure_sections() -> List[Tuple[str, bytes]]:
         ("stack_underflow", stack_underflow_section()),
         ("unsupported_version", unsupported_version_section()),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Continuous-unwind fixtures (rbp-chained call stacks)
+# ---------------------------------------------------------------------------
+
+def _chain_cie() -> bytes:
+    # CFA=rsp+8; rip=[CFA-8]; rbp=[CFA-16].
+    init = (bytes([DEF_CFA]) + uleb(RSP) + uleb(8)
+            + bytes([0x80 | RIP]) + uleb(1)
+            + bytes([0x80 | RBP]) + uleb(2))
+    return cie(init)
+
+
+def _rbp_frame_insns(extra: bytes = b"") -> bytes:
+    """loc>=1: CFA=rbp+16 — classic frame-pointer chain (saved rbp at
+    [rbp], return address at [rbp+8]).  Every frame then recovers rbp
+    and rip, which are exactly the inputs the next frame needs."""
+    return (bytes([ADV | 1])
+            + bytes([DEF_CFA_REG]) + uleb(RBP)
+            + bytes([DEF_CFA_OFF]) + uleb(16)
+            + extra)
+
+
+def chain_section() -> Tuple[bytes, dict]:
+    """Three rbp-chained frames; the outermost caller PC hits no FDE."""
+    insns = _rbp_frame_insns()
+    data = (_chain_cie()
+            + fde(0, 0x401000, 0x40, insns)   # innermost
+            + fde(0, 0x402000, 0x40, insns)   # middle
+            + fde(0, 0x403000, 0x40, insns))  # outermost
+    inputs = {
+        "pc": 0x401001,
+        "registers_text": "rbp=0x9000",
+        "memory_text": (
+            "0x9000=0x8000\n"    # [rbp]   saved rbp   -> frame 1 rbp
+            "0x9008=0x402005\n"  # [rbp+8] return addr -> frame 1 PC
+            "0x8000=0x7000\n"
+            "0x8008=0x403003\n"  # -> frame 2 PC
+            "0x7000=0x0\n"
+            "0x7008=0x4fffff\n"  # outermost caller PC: misses every FDE
+        ),
+    }
+    return data, inputs
+
+
+def loop_section() -> Tuple[bytes, dict]:
+    """One function whose unwind state alternates and then repeats."""
+    data = _chain_cie() + fde(0, 0x404000, 0x40, _rbp_frame_insns())
+    inputs = {
+        "pc": 0x404001,
+        "registers_text": "rbp=0x6000",
+        "memory_text": (
+            "0x6000=0x5000\n"
+            "0x6008=0x404005\n"  # frame 1: PC=0x404005, rbp=0x5000
+            "0x5000=0x6000\n"
+            "0x5008=0x404001\n"  # frame 2+ states recur -> loop
+        ),
+    }
+    return data, inputs
+
+
+def spin_section() -> Tuple[bytes, dict]:
+    """Caller PC equals the frame's own PC: unwinding makes no progress."""
+    data = _chain_cie() + fde(0, 0x405000, 0x40, _rbp_frame_insns())
+    inputs = {
+        "pc": 0x405001,
+        "registers_text": "rbp=0x4000",
+        "memory_text": (
+            "0x4000=0x3000\n"
+            "0x4008=0x405001\n"  # caller PC == current PC
+        ),
+    }
+    return data, inputs
+
+
+def broken_chain_section() -> Tuple[bytes, dict]:
+    """Frame 1 marks the return-address column undefined: the caller PC
+    becomes unrecoverable *after* frame 0, so the whole chain must be
+    discarded with the failing frame located."""
+    inner = fde(0, 0x401000, 0x40, _rbp_frame_insns())
+    broken = fde(0, 0x402000, 0x40,
+                 _rbp_frame_insns(bytes([UNDEF]) + uleb(RIP)))
+    data = _chain_cie() + inner + broken
+    inputs = {
+        "pc": 0x401001,
+        "registers_text": "rbp=0x9000",
+        "memory_text": (
+            "0x9000=0x8000\n"
+            "0x9008=0x402005\n"  # frame 1 PC lands in the broken FDE
+        ),
+    }
+    return data, inputs

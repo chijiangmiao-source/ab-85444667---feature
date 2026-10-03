@@ -13,11 +13,16 @@ Exit code is 0 only when every check passes:
 1. build check (byte-compile all sources);
 2. engine code tests — valid nested remember/restore rules, later-PC
    evidence rollback after restore_state, caller-PC recovery, misses;
-3. rejection tests — truncated FDE, dangling CIE pointer, truncated
+3. continuous-backtrace tests — valid multi-frame chains fed only by
+   recovered registers + caller PC, normal miss chain tails, loop /
+   no-progress / frame-limit termination, and subsequent-frame
+   failures discarding the whole chain with the failing frame and raw
+   section offset located;
+4. rejection tests — truncated FDE, dangling CIE pointer, truncated
    ULEB128/SLEB128, rule-stack underflow, unsupported CIE version,
    out-of-bounds CFA memory read, unrecoverable caller PC — each
    anchored at its first raw section offset with no partial results;
-4. API/HTTP smoke using both valid and failing inputs.
+5. API/HTTP smoke using both valid and failing inputs.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ import urllib.parse
 from http.server import ThreadingHTTPServer
 from typing import Optional, Tuple
 
-from .eh_frame import EHFrameError, analyze, parse_section
+from .eh_frame import EHFrameError, analyze, parse_section, unwind
 from . import samplegen as sg
 from .server import _Handler, build_response, static_sample_payload
 
@@ -97,7 +102,7 @@ def parse_inputs2(inputs: dict):
 
 
 def test_engine() -> None:
-    print("[1/4] 引擎代码测试")
+    print("[1/5] 引擎代码测试")
     data, inputs = sg.main_section()
     section = parse_section(data)
     check("解析出 1 个 CIE 与 1 个 FDE",
@@ -336,8 +341,112 @@ def test_extended_ops_and_multi_fde() -> None:
 
 
 
+def test_unwind() -> None:
+    print("[2/5] 连续回溯（多帧展开）引擎测试")
+
+    # --- valid multi-frame chain ending in a normal miss tail ---
+    data, inputs = sg.chain_section()
+    section = parse_section(data)
+    regs, mem = parse_inputs2(inputs)
+
+    res = unwind(section, inputs["pc"], regs, mem, 8)
+    check("多帧链：命中且共 3 帧", res.hit and len(res.frames) == 3,
+          "frames=%d" % len(res.frames))
+    check("多帧链：正常未命中链尾（tail_miss）",
+          res.stop_kind == "tail_miss", res.stop_kind)
+    pcs = [f.pc for f in res.frames]
+    check("多帧链：逐帧 PC = 0x401001 → 0x402005 → 0x403003",
+          pcs == [0x401001, 0x402005, 0x403003],
+          " ".join(hex(p) for p in pcs))
+    check("多帧链：逐帧命中各自 FDE",
+          [f.result.fde.initial_location for f in res.frames]
+          == [0x401000, 0x402000, 0x403000])
+    cfas = [f.result.cfa_value for f in res.frames]
+    check("多帧链：逐帧 CFA = 0x9010 / 0x8010 / 0x7010",
+          cfas == [0x9010, 0x8010, 0x7010],
+          " ".join(hex(c) for c in cfas))
+    check("多帧链：逐帧调用者 PC 正确",
+          [f.result.caller_pc for f in res.frames]
+          == [0x402005, 0x403003, 0x4FFFFF])
+    check("多帧链：帧 1 输入仅含上一帧恢复的 rbp 与调用者 PC",
+          res.frames[1].registers == {sg.RBP: 0x8000, sg.RIP: 0x402005},
+          str(res.frames[1].registers))
+    check("多帧链：每帧均记录所用内存读取",
+          all(f.result.memory_reads for f in res.frames))
+
+    # --- frame limit termination ---
+    res_lim = unwind(section, inputs["pc"], regs, mem, 2)
+    check("帧上限 2：恰返回 2 帧且终止原因为 frame_limit",
+          len(res_lim.frames) == 2
+          and res_lim.stop_kind == "frame_limit",
+          "%s frames=%d" % (res_lim.stop_kind, len(res_lim.frames)))
+
+    # --- loop: a full call state recurs -> repeat_state ---
+    ldata, linputs = sg.loop_section()
+    lregs, lmem = parse_inputs2(linputs)
+    res_loop = unwind(parse_section(ldata), linputs["pc"], lregs, lmem, 16)
+    check("循环：repeat_state 终止并保留此前完整帧",
+          res_loop.stop_kind == "repeat_state"
+          and len(res_loop.frames) == 3
+          and [f.pc for f in res_loop.frames]
+              == [0x404001, 0x404005, 0x404001],
+          "%s frames=%d" % (res_loop.stop_kind, len(res_loop.frames)))
+
+    # --- spin: caller PC == own PC -> no_progress ---
+    sdata, sinputs = sg.spin_section()
+    sregs, smem = parse_inputs2(sinputs)
+    res_spin = unwind(parse_section(sdata), sinputs["pc"], sregs, smem, 8)
+    check("自旋：no_progress 终止并保留 1 帧",
+          res_spin.stop_kind == "no_progress"
+          and len(res_spin.frames) == 1,
+          "%s frames=%d" % (res_spin.stop_kind, len(res_spin.frames)))
+
+    # --- subsequent-frame memory OOB: whole chain discarded ---
+    broken_mem = {a: v for a, v in mem.items() if a not in (0x8000, 0x8008)}
+    try:
+        unwind(section, inputs["pc"], regs, broken_mem, 8)
+        check("后续帧内存越界：整条链路拒绝", False, "未抛出异常")
+    except EHFrameError as exc:
+        check("后续帧内存越界：定位失败帧 #1 与既有原始偏移 0x10",
+              exc.frame == 1 and exc.offset == 0x10,
+              "frame=%s offset=0x%x" % (exc.frame, exc.offset))
+
+    # --- subsequent-frame unrecoverable caller: chain discarded ---
+    bdata, binputs = sg.broken_chain_section()
+    bregs, bmem = parse_inputs2(binputs)
+    try:
+        unwind(parse_section(bdata), binputs["pc"], bregs, bmem, 8)
+        check("后续帧调用者不可恢复：整条链路拒绝", False, "未抛出异常")
+    except EHFrameError as exc:
+        check("后续帧调用者不可恢复：定位失败帧 #1 与既有原始偏移",
+              exc.frame == 1 and isinstance(exc.offset, int),
+              "frame=%s offset=0x%x" % (exc.frame, exc.offset))
+
+    # --- first-frame failure keeps single-frame semantics (no frame tag) ---
+    try:
+        unwind(section, inputs["pc"], regs, {}, 8)
+        check("首帧内存越界：按既有单帧语义拒绝", False, "未抛出异常")
+    except EHFrameError as exc:
+        check("首帧内存越界：按既有单帧语义拒绝（无帧标记）",
+              exc.frame is None, "frame=%s" % exc.frame)
+
+    # --- first-frame miss: hit=false, no frames ---
+    res_miss = unwind(section, 0x4FFFFF, regs, mem, 8)
+    check("首帧未命中：hit=false 且无帧",
+          not res_miss.hit and res_miss.frames == []
+          and bool(res_miss.miss_reason))
+
+    # --- frame-limit bounds ---
+    for bad in (1, 17):
+        try:
+            unwind(section, inputs["pc"], regs, mem, bad)
+            check("帧上限 %d 被拒绝" % bad, False, "未抛出异常")
+        except ValueError:
+            check("帧上限 %d 被拒绝（ValueError）" % bad, True)
+
+
 def test_failures() -> None:
-    print("[2/4] 畸形输入拒绝测试（定位首个原始偏移，无部分结果）")
+    print("[3/5] 畸形输入拒绝测试（定位首个原始偏移，无部分结果）")
     # truncated FDE: length word overrun anchored at the FDE start.
     trunc = sg.truncated_fde_section()
     cie_len = len(sg.cie(
@@ -375,7 +484,7 @@ def test_failures() -> None:
 
 
 def test_build() -> None:
-    print("[3/4] 构建检查（compileall）")
+    print("[4/5] 构建检查（compileall）")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ok = compileall.compile_dir(os.path.join(root, "app"), quiet=1)
     check("全部 Python 源字节码编译通过", bool(ok))
@@ -411,7 +520,7 @@ def _request(method: str, url: str, payload=None, timeout: float = 5.0):
 
 
 def test_http() -> None:
-    print("[4/4] API / HTTP 冒烟")
+    print("[5/5] API / HTTP 冒烟")
     base = os.environ.get("EHF_SMOKE_URL")
     httpd = None
     if base:
@@ -513,6 +622,105 @@ def test_http() -> None:
               and "registers" not in body, json.dumps(
                   body, ensure_ascii=False)[:200])
 
+        # --- continuous backtrace over the real HTTP interface ---
+        cdata, cinputs = sg.chain_section()
+        cb64 = base64.b64encode(cdata).decode("ascii")
+
+        # valid multi-frame chain ending in a normal miss tail
+        status, body = _request("POST", base + "/api/analyze", {
+            "section_base64": cb64, "pc": hex(cinputs["pc"]),
+            "registers_text": cinputs["registers_text"],
+            "memory_text": cinputs["memory_text"],
+            "unwind": True, "max_frames": 8})
+        frames = body.get("frames", [])
+        check("连续回溯：有效多帧链 → 200，3 帧，正常链尾",
+              status == 200 and body.get("unwind") is True
+              and body.get("frame_count") == 3
+              and body.get("stop", {}).get("kind") == "tail_miss"
+              and [f.get("pc") for f in frames]
+                  == [0x401001, 0x402005, 0x403003]
+              and frames[1]["cfa"]["value"] == 0x8010
+              and frames[2]["caller_pc"] == 0x4FFFFF
+              and frames[0]["memory_reads"]
+              and frames[1]["input_registers"] == [
+                  {"number": sg.RBP, "name": "rbp", "value": 0x8000},
+                  {"number": sg.RIP, "name": "rip", "value": 0x402005}],
+              json.dumps(body, ensure_ascii=False)[:300])
+
+        # frame-limit termination
+        status, body = _request("POST", base + "/api/analyze", {
+            "section_base64": cb64, "pc": hex(cinputs["pc"]),
+            "registers_text": cinputs["registers_text"],
+            "memory_text": cinputs["memory_text"],
+            "unwind": True, "max_frames": 2})
+        check("连续回溯：帧上限 2 → frame_limit 终止",
+              status == 200 and body.get("frame_count") == 2
+              and body.get("stop", {}).get("kind") == "frame_limit",
+              json.dumps(body, ensure_ascii=False)[:200])
+
+        # loop termination
+        ldata, linputs = sg.loop_section()
+        status, body = _request("POST", base + "/api/analyze", {
+            "section_base64": base64.b64encode(ldata).decode("ascii"),
+            "pc": hex(linputs["pc"]),
+            "registers_text": linputs["registers_text"],
+            "memory_text": linputs["memory_text"],
+            "unwind": True, "max_frames": 16})
+        check("连续回溯：循环 → repeat_state 终止并保留完整帧",
+              status == 200
+              and body.get("stop", {}).get("kind") == "repeat_state"
+              and body.get("frame_count") == 3,
+              json.dumps(body, ensure_ascii=False)[:200])
+
+        # subsequent-frame memory OOB: 422, failing frame located, no chain
+        status, body = _request("POST", base + "/api/analyze", {
+            "section_base64": cb64, "pc": hex(cinputs["pc"]),
+            "registers_text": cinputs["registers_text"],
+            "memory_text": "0x9000=0x8000\n0x9008=0x402005",
+            "unwind": True, "max_frames": 8})
+        check("连续回溯：后续帧内存越界 → 422，定位失败帧且无部分链路",
+              status == 422 and body.get("frame") == 1
+              and isinstance(body.get("offset"), int)
+              and "frames" not in body,
+              json.dumps(body, ensure_ascii=False)[:200])
+
+        # subsequent-frame unrecoverable caller: 422, no chain
+        bdata, binputs = sg.broken_chain_section()
+        status, body = _request("POST", base + "/api/analyze", {
+            "section_base64": base64.b64encode(bdata).decode("ascii"),
+            "pc": hex(binputs["pc"]),
+            "registers_text": binputs["registers_text"],
+            "memory_text": binputs["memory_text"],
+            "unwind": True, "max_frames": 8})
+        check("连续回溯：后续帧调用者不可恢复 → 422 且无部分链路",
+              status == 422 and body.get("frame") == 1
+              and "frames" not in body,
+              json.dumps(body, ensure_ascii=False)[:200])
+
+        # invalid frame limits -> 400
+        for bad in (1, 17, None):
+            req = {"section_base64": cb64, "pc": hex(cinputs["pc"]),
+                   "registers_text": cinputs["registers_text"],
+                   "memory_text": cinputs["memory_text"],
+                   "unwind": True}
+            if bad is not None:
+                req["max_frames"] = bad
+            status, body = _request("POST", base + "/api/analyze", req)
+            check("连续回溯：帧上限 %r → 400" % bad,
+                  status == 400 and "error" in body, str(body)[:120])
+
+        # first-frame miss in unwind mode -> 200 hit=false, no frames
+        status, body = _request("POST", base + "/api/analyze", {
+            "section_base64": cb64, "pc": "0x4fffff",
+            "registers_text": cinputs["registers_text"],
+            "memory_text": cinputs["memory_text"],
+            "unwind": True, "max_frames": 8})
+        check("连续回溯：首帧未命中 → 200 hit=false 且无帧",
+              status == 200 and body.get("hit") is False
+              and body.get("unwind") is True
+              and "frames" not in body,
+              json.dumps(body, ensure_ascii=False)[:200])
+
         # unknown route
         status, _ = _request("GET", base + "/nope")
         check("未知路径 → 404", status == 404)
@@ -528,6 +736,7 @@ def main() -> int:
     try:
         test_build()
         test_engine()
+        test_unwind()
         test_failures()
         test_http()
     except Exception as exc:  # noqa: BLE001

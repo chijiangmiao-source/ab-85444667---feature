@@ -18,6 +18,15 @@ Every malformed input raises :class:`EHFrameError` anchored at the
 *first* raw byte offset where the problem is detectable.  Analyses
 either return a complete :class:`AnalysisResult` or raise — partial
 register results are never produced.
+
+Continuous backtrace (:func:`unwind`) reduces the current frame with
+the exact single-frame rules, then feeds *only* the registers that
+frame recovered plus its caller PC into the next frame, up to a
+user-chosen limit of 2–16 frames.  A caller PC that hits no FDE is a
+normal chain tail; PC-not-advancing, repeated call states and the
+frame limit are explicit termination reasons.  Any failure in a
+*subsequent* frame discards the whole chain — partial chains are
+never returned.
 """
 
 from __future__ import annotations
@@ -33,6 +42,10 @@ from typing import Dict, List, Optional, Tuple
 CIE_MARKER = 0  # the 4-byte id word of a CIE is exactly zero
 
 MAX_SECTION_SIZE = 192 * 1024  # 192 KiB raw section limit
+
+# Continuous-backtrace frame-limit bounds accepted by unwind().
+MIN_UNWIND_FRAMES = 2
+MAX_UNWIND_FRAMES = 16
 
 
 class Op:
@@ -90,13 +103,20 @@ def parse_reg_number(text: str) -> int:
 
 
 class EHFrameError(Exception):
-    """Parsing or reduction failure anchored at a raw section offset."""
+    """Parsing or reduction failure anchored at a raw section offset.
 
-    def __init__(self, message: str, offset: int):
+    ``frame`` is set only by :func:`unwind`: the index of the frame
+    whose reduction failed.  The whole chain is discarded in that
+    case — partial chains are never returned.
+    """
+
+    def __init__(self, message: str, offset: int,
+                 frame: Optional[int] = None):
         super().__init__("%s（首个原始偏移 0x%x / %d）"
                          % (message, offset, offset))
         self.message = message
         self.offset = offset
+        self.frame = frame
 
 
 # ---------------------------------------------------------------------------
@@ -887,3 +907,143 @@ def analyze(section: FrameSection, pc: int,
         result.registers.append(rec)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Continuous backtrace (multi-frame unwinding)
+# ---------------------------------------------------------------------------
+
+# Termination kinds for unwind().  All four keep every frame completed
+# so far; only a *failure* (EHFrameError) discards the chain.
+STOP_TAIL_MISS = "tail_miss"        # caller PC hits no FDE: normal chain tail
+STOP_NO_PROGRESS = "no_progress"    # caller PC equals the frame's own PC
+STOP_REPEAT_STATE = "repeat_state"  # full call state recurs: loop
+STOP_FRAME_LIMIT = "frame_limit"    # user-chosen frame limit reached
+
+
+@dataclass
+class UnwindFrame:
+    """One fully reduced frame of a continuous backtrace."""
+
+    index: int
+    pc: int
+    registers: Dict[int, int]  # exact register inputs analyze() consumed
+    result: AnalysisResult
+
+
+@dataclass
+class UnwindResult:
+    hit: bool
+    max_frames: int
+    frames: List[UnwindFrame] = field(default_factory=list)
+    stop_kind: str = ""
+    stop_reason: str = ""
+    miss_reason: str = ""  # first-frame miss only (existing semantics)
+
+
+def unwind(section: FrameSection, pc: int,
+           registers: Dict[int, int],
+           memory: Optional[Dict[int, int]] = None,
+           max_frames: int = MAX_UNWIND_FRAMES) -> UnwindResult:
+    """Continuously unwind caller frames starting at ``pc``.
+
+    Frame 0 is reduced by the exact single-frame rules of
+    :func:`analyze`.  Each following frame is fed **only** the
+    registers its predecessor recovered plus the predecessor's caller
+    PC (placed in the CIE return-address column) — the original
+    user-supplied register set is never reused.  The same section and
+    memory snapshot serve every frame.
+
+    Termination is explicit and keeps all completed frames:
+
+    * ``tail_miss`` — a caller PC hits no FDE (normal chain tail);
+    * ``no_progress`` — a caller PC equals its own frame's PC;
+    * ``repeat_state`` — a (PC, registers) call state recurs (loop);
+    * ``frame_limit`` — ``max_frames`` frames were produced.
+
+    Any :class:`EHFrameError` raised while reducing a *subsequent*
+    frame (out-of-bounds memory read, unrecoverable caller PC,
+    malformed record) is re-raised anchored at the same raw section
+    offset and tagged with the failing ``frame`` index; the caller
+    must then discard the whole chain — partial chains are never
+    returned.  A failure or miss in frame 0 keeps the existing
+    single-frame semantics.
+    """
+    if isinstance(max_frames, bool) or not isinstance(max_frames, int):
+        raise ValueError("帧上限必须是整数")
+    if not MIN_UNWIND_FRAMES <= max_frames <= MAX_UNWIND_FRAMES:
+        raise ValueError("帧上限必须在 %d–%d 之间，得到 %d"
+                         % (MIN_UNWIND_FRAMES, MAX_UNWIND_FRAMES,
+                            max_frames))
+
+    memory = dict(memory or {})
+    current_pc = pc
+    current_regs = {n: v & 0xFFFFFFFFFFFFFFFF
+                    for n, v in registers.items()}
+    frames: List[UnwindFrame] = []
+    seen_states = set()
+    stop_kind = ""
+    stop_reason = ""
+
+    for index in range(max_frames):
+        state_key = (current_pc, tuple(sorted(current_regs.items())))
+        if state_key in seen_states:
+            stop_kind = STOP_REPEAT_STATE
+            stop_reason = (
+                "第 %d 帧的调用状态（PC 0x%x 与全部输入寄存器）与此前帧完全"
+                "重复，判定为循环，终止；保留此前 %d 个完整帧"
+                % (index, current_pc, len(frames)))
+            break
+        seen_states.add(state_key)
+
+        try:
+            result = analyze(section, current_pc, current_regs, memory)
+        except EHFrameError as exc:
+            if index == 0:
+                raise  # first frame: existing single-frame semantics
+            raise EHFrameError(
+                "连续回溯第 %d 帧（PC 0x%x）归约失败：%s；"
+                "整条链路已丢弃，不返回部分链路"
+                % (index, current_pc, exc.message),
+                exc.offset, frame=index) from exc
+
+        if not result.hit:
+            if index == 0:
+                # The user's own PC misses: existing miss semantics.
+                return UnwindResult(hit=False, max_frames=max_frames,
+                                    miss_reason=result.miss_reason)
+            stop_kind = STOP_TAIL_MISS
+            stop_reason = (
+                "调用者 PC 0x%x 未命中任何 FDE，到达正常链尾；"
+                "保留此前 %d 个完整帧" % (current_pc, len(frames)))
+            break
+
+        frames.append(UnwindFrame(index=index, pc=current_pc,
+                                  registers=dict(current_regs),
+                                  result=result))
+
+        next_pc = result.caller_pc
+        assert next_pc is not None  # analyze() raises otherwise
+        if next_pc == current_pc:
+            stop_kind = STOP_NO_PROGRESS
+            stop_reason = (
+                "第 %d 帧恢复出的调用者 PC 0x%x 与本帧 PC 相同，PC 未推进，"
+                "终止；保留已完成的 %d 个帧" % (index, next_pc, len(frames)))
+            break
+
+        # The next frame is fed ONLY what this frame recovered, plus
+        # the caller PC in the CIE return-address column.
+        next_regs = {r.number: r.value for r in result.registers
+                     if r.recoverable and r.value is not None}
+        assert result.cie is not None
+        next_regs[result.cie.ra_column] = next_pc
+        current_pc, current_regs = next_pc, next_regs
+    else:
+        stop_kind = STOP_FRAME_LIMIT
+        stop_reason = ("达到帧上限 %d（允许 %d–%d），终止；"
+                       "已完成的 %d 个帧全部保留"
+                       % (max_frames, MIN_UNWIND_FRAMES,
+                          MAX_UNWIND_FRAMES, len(frames)))
+
+    return UnwindResult(hit=True, max_frames=max_frames, frames=frames,
+                        stop_kind=stop_kind, stop_reason=stop_reason)
