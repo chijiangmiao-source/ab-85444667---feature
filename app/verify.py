@@ -35,9 +35,14 @@ import urllib.parse
 from http.server import ThreadingHTTPServer
 from typing import Optional, Tuple
 
-from .eh_frame import EHFrameError, analyze, parse_section
+from .eh_frame import (
+    EHFrameError, ChainError, analyze, analyze_chain, reg_name,
+    recovered_caller_registers, parse_section,
+)
 from . import samplegen as sg
-from .server import _Handler, build_response, static_sample_payload
+from .server import (
+    _Handler, build_response, static_sample_payload, chain_sample_payload,
+)
 
 FAILURES = []
 PASSED = 0
@@ -97,7 +102,7 @@ def parse_inputs2(inputs: dict):
 
 
 def test_engine() -> None:
-    print("[1/4] 引擎代码测试")
+    print("[1/5] 引擎代码测试")
     data, inputs = sg.main_section()
     section = parse_section(data)
     check("解析出 1 个 CIE 与 1 个 FDE",
@@ -335,9 +340,181 @@ def test_extended_ops_and_multi_fde() -> None:
                                  {sg.RSP: 0x1}, {0x1: 0x0}))
 
 
+def _chain_inputs(inputs: dict):
+    regs, mem = {}, {}
+    for line in inputs["registers_text"].splitlines():
+        k, v = line.split("=", 1)
+        regs[_REG_ALIAS[k.strip().upper()]] = int(v, 0)
+    for line in inputs["memory_text"].splitlines():
+        a, v = line.split("=", 1)
+        mem[int(a, 0)] = int(v, 0)
+    return regs, mem
+
+
+def test_chain_engine() -> None:
+    """Consecutive backtrace: valid chain, normal miss tail, loop
+    termination, PC non-progress, frame cap, and later-frame failure
+    that drops the whole chain."""
+    print("[2/5] 连续回溯引擎测试")
+
+    # --- valid multi-frame chain ending in a normal uncovered tail ---
+    data, inputs = sg.chain_section()
+    section = parse_section(data)
+    regs, mem = _chain_inputs(inputs)
+    chain = analyze_chain(section, inputs["pc"], regs, mem, 8)
+    check("有效多帧链：3 帧全部归约",
+          len(chain.frames) == 3, str(len(chain.frames)))
+    check("有效多帧链：PC 序列 0x401000 -> 0x402000 -> 0x403000",
+          [f.pc for f in chain.frames] == [0x401000, 0x402000, 0x403000],
+          str([hex(f.pc) for f in chain.frames]))
+    check("有效多帧链：末帧调用者 PC = 0x404000",
+          chain.frames[-1].caller_pc == 0x404000)
+    check("有效多帧链：CFA 逐帧推进 0x1008/0x1010/0x1018",
+          [f.cfa_value for f in chain.frames] == [0x1008, 0x1010, 0x1018])
+    check("有效多帧链：以 caller_pc_miss 作为正常链尾终止",
+          chain.stop_reason == "caller_pc_miss", chain.stop_reason)
+    # Each later frame is fed only recovered registers (never the
+    # return-address column) and, separately, the recovered caller PC.
+    f1_inputs = recovered_caller_registers(chain.frames[0])
+    check("帧 1 输入寄存器仅 rsp=CFA=0x1008，且不含返回地址列 rip",
+          f1_inputs.get(sg.RSP) == 0x1008
+          and sg.RIP not in f1_inputs
+          and set(f1_inputs) == {sg.RSP},
+          str({reg_name(k): hex(v) for k, v in f1_inputs.items()}))
+    check("帧 1 的下一 PC 单独取本帧调用者 PC 0x402000",
+          chain.frames[0].caller_pc == 0x402000)
+    # Every frame still reports its own full evidence (FDE/CFA/rules/
+    # memory reads), reduced against the same section & snapshots.
+    check("每帧均命中 FDE 并给出 CFA、调用者 PC 与内存读取",
+          all(f.hit and f.fde is not None and f.cfa_value is not None
+              and f.caller_pc is not None and len(f.memory_reads) >= 1
+              for f in chain.frames))
+
+    # --- same chain, capped at 2 -> frame_limit termination ---
+    capped = analyze_chain(section, inputs["pc"], regs, mem, 2)
+    check("帧上限 2：只归约 2 帧且以 frame_limit 终止",
+          len(capped.frames) == 2 and capped.stop_reason == "frame_limit",
+          "%s / %d" % (capped.stop_reason, len(capped.frames)))
+
+    # --- PC does not advance (self loop) ---
+    d2, i2 = sg.chain_self_section()
+    s2 = parse_section(d2)
+    r2, m2 = _chain_inputs(i2)
+    self_chain = analyze_chain(s2, i2["pc"], r2, m2, 8)
+    check("PC 未推进：保留 1 帧并以 pc_not_advanced 终止",
+          len(self_chain.frames) == 1
+          and self_chain.stop_reason == "pc_not_advanced",
+          "%s / %d" % (self_chain.stop_reason, len(self_chain.frames)))
+    check("PC 未推进：终止说明明确",
+          "PC 未推进" in self_chain.stop_detail)
+
+    # --- repeated call state (A -> B -> A cycle) ---
+    d3, i3 = sg.chain_cycle_section()
+    s3 = parse_section(d3)
+    r3, m3 = _chain_inputs(i3)
+    cyc = analyze_chain(s3, i3["pc"], r3, m3, 16)
+    check("循环链：以 duplicate_state 终止且保留此前完整帧",
+          cyc.stop_reason == "duplicate_state" and len(cyc.frames) == 2,
+          "%s / %d" % (cyc.stop_reason, len(cyc.frames)))
+    check("循环链：A->B 后，B 恢复出的下一输入状态与 A 的输入状态重复",
+          [f.pc for f in cyc.frames] == [0x501000, 0x502000]
+          and cyc.frames[-1].caller_pc == 0x501000)
+    check("循环链：终止说明明确",
+          "重复落入同一调用状态" in cyc.stop_detail)
+
+    # --- later frame unrecoverable caller PC: whole chain rejected ---
+    d4, i4 = sg.chain_unrecoverable_section()
+    s4 = parse_section(d4)
+    r4, m4 = _chain_inputs(i4)
+    try:
+        analyze_chain(s4, i4["pc"], r4, m4, 8)
+        check("后续帧调用者 PC 不可恢复：整条回溯拒绝且无部分链路", False,
+              "应当抛出 ChainError")
+    except ChainError as exc:
+        check("后续帧调用者 PC 不可恢复：定位到失败帧 1 与原始偏移",
+              exc.frame_index == 1 and exc.pc == 0x602000
+              and isinstance(exc.error.offset, int)
+              and exc.error.offset == s4.fdes[1].instructions_offset,
+              "frame=%s off=%s" % (exc.frame_index,
+                                   hex(exc.error.offset)))
+
+    # --- later frame malformed opcode: whole chain rejected ---
+    d5, i5 = sg.chain_bad_opcode_section()
+    s5 = parse_section(d5)
+    r5, m5 = _chain_inputs(i5)
+    try:
+        analyze_chain(s5, i5["pc"], r5, m5, 8)
+        check("后续帧格式错误：整条回溯拒绝且无部分链路", False,
+              "应当抛出 ChainError")
+    except ChainError as exc:
+        check("后续帧格式错误：定位到失败帧 1 及保留操作码偏移",
+              exc.frame_index == 1 and exc.pc == 0x802000
+              and exc.error.offset == s5.fdes[1].instructions_offset,
+              "frame=%s off=%s" % (exc.frame_index,
+                                   hex(exc.error.offset)))
+
+    # --- later frame memory out of bounds: whole chain rejected ---
+    # Frame 0 of the valid chain needs 0x1000; frame 1 then needs
+    # 0x1008 which we omit -> frame 1 must fail, no partial chain.
+    try:
+        analyze_chain(section, inputs["pc"], regs, {0x1000: 0x402000}, 8)
+        check("后续帧内存越界：整条回溯拒绝且无部分链路", False,
+              "应当抛出 ChainError")
+    except ChainError as exc:
+        check("后续帧内存越界：定位失败帧 1 与 CFI 原始偏移",
+              exc.frame_index == 1 and isinstance(exc.error.offset, int))
+
+    # --- frame 0 hard failure is propagated as the original error ---
+    # Frame 0 hits an FDE but its offset read needs 0x1000, absent from
+    # the snapshot: single-frame semantics (EHFrameError), not a chain.
+    try:
+        analyze_chain(section, inputs["pc"], regs, {}, 8)
+        check("第 0 帧内存越界仍以 EHFrameError（既有语义）抛出", False,
+              "应当抛出 EHFrameError")
+    except ChainError:
+        check("第 0 帧内存越界仍以 EHFrameError（既有语义）抛出", False,
+              "不应包装为 ChainError")
+    except EHFrameError:
+        check("第 0 帧内存越界仍以 EHFrameError（既有语义）抛出", True)
+
+    # --- initial PC miss yields an empty-frame chain (normal tail) ---
+    miss0 = analyze_chain(section, 0x409000, regs, mem, 8)
+    check("起始 PC 未命中：0 帧且 initial_miss",
+          miss0.frames == [] and miss0.stop_reason == "initial_miss")
+
+    # --- max_frames validation ---
+    for bad in (1, 17, 0, -1, "8"):
+        try:
+            analyze_chain(section, inputs["pc"], regs, mem, bad)
+            check("帧上限越界值 %r 被拒绝" % bad, False, "应抛 ValueError")
+        except ValueError:
+            check("帧上限越界值 %r 被拒绝" % bad, True)
+        except Exception as exc:  # noqa: BLE001
+            check("帧上限越界值 %r 被拒绝" % bad, False,
+                  "抛出 %s" % type(exc).__name__)
+
+    # --- frame 0 reduced identically to single-frame analyze() ---
+    single = analyze(section, inputs["pc"], regs, mem)
+    check("连续回溯帧 0 与单帧 analyze 结论一致（CFA/调用者 PC/规则）",
+          chain.frames[0].cfa_value == single.cfa_value
+          and chain.frames[0].caller_pc == single.caller_pc
+          and [(r.number, r.rule.kind, r.value)
+               for r in chain.frames[0].registers]
+          == [(r.number, r.rule.kind, r.value) for r in single.registers])
+
+
+def reg_name_k(num: int) -> str:
+    from .eh_frame import reg_name as _rn
+    return _rn(num)
+
+
+def reg_name_k(num: int) -> str:
+    from .eh_frame import reg_name as _rn
+    return _rn(num)
+
 
 def test_failures() -> None:
-    print("[2/4] 畸形输入拒绝测试（定位首个原始偏移，无部分结果）")
+    print("[3/5] 畸形输入拒绝测试（定位首个原始偏移，无部分结果）")
     # truncated FDE: length word overrun anchored at the FDE start.
     trunc = sg.truncated_fde_section()
     cie_len = len(sg.cie(
@@ -375,7 +552,7 @@ def test_failures() -> None:
 
 
 def test_build() -> None:
-    print("[3/4] 构建检查（compileall）")
+    print("[4/5] 构建检查（compileall）")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ok = compileall.compile_dir(os.path.join(root, "app"), quiet=1)
     check("全部 Python 源字节码编译通过", bool(ok))
@@ -411,7 +588,7 @@ def _request(method: str, url: str, payload=None, timeout: float = 5.0):
 
 
 def test_http() -> None:
-    print("[4/4] API / HTTP 冒烟")
+    print("[5/5] API / HTTP 冒烟")
     base = os.environ.get("EHF_SMOKE_URL")
     httpd = None
     if base:
@@ -440,6 +617,11 @@ def test_http() -> None:
         status, sample = _request("GET", base + "/static_sample")
         check("GET /static_sample → 200", status == 200
               and "section_base64" in sample)
+
+        status, csample = _request("GET", base + "/chain_sample")
+        check("GET /chain_sample → 200", status == 200
+              and "section_base64" in csample
+              and csample.get("max_frames") == 8)
 
         data, inputs = sg.main_section()
         b64 = base64.b64encode(data).decode("ascii")
@@ -513,6 +695,119 @@ def test_http() -> None:
               and "registers" not in body, json.dumps(
                   body, ensure_ascii=False)[:200])
 
+        # ------------------------------------------------------------------
+        # Consecutive backtrace over the real HTTP interface
+        # ------------------------------------------------------------------
+
+        def chain_post(fixture, max_frames, mem_override=None):
+            raw, ci = fixture
+            return _request("POST", base + "/api/analyze", {
+                "section_base64": base64.b64encode(raw).decode("ascii"),
+                "pc": hex(ci["pc"]),
+                "registers_text": ci["registers_text"],
+                "memory_text": (mem_override if mem_override is not None
+                                else ci["memory_text"]),
+                "max_frames": max_frames})
+
+        # valid multi-frame chain ending in a normal uncovered tail
+        status, body = chain_post(sg.chain_section(), 8)
+        frames = body.get("frames", [])
+        check("HTTP 连续回溯：200 mode=chain，3 帧且正常链尾",
+              status == 200 and body.get("mode") == "chain"
+              and body.get("frame_count") == 3
+              and body.get("stop_reason") == "caller_pc_miss"
+              and [f["pc"] for f in frames]
+              == [0x401000, 0x402000, 0x403000]
+              and frames[-1]["caller_pc"] == 0x404000,
+              json.dumps(body, ensure_ascii=False)[:300])
+        # Every frame carries the full single-frame evidence shape.
+        f0 = frames[0]
+        check("HTTP 连续回溯：每帧含 FDE/CIE/CFA/规则/内存读取/时间线",
+              all(("fde" in f and "cie" in f and "cfa" in f
+                   and "caller_pc_rule" in f and "registers" in f
+                   and "memory_reads" in f and "timeline" in f
+                   and "next_frame_input_registers" in f)
+                  for f in frames))
+        check("HTTP 连续回溯：帧 0 与单帧响应证据一致（CFA/调用者 PC）",
+              f0["cfa"]["value"] == 0x1008 and f0["caller_pc"] == 0x402000)
+        check("HTTP 连续回溯：逐帧展示下一帧输入（rsp=CFA；rip 不作寄存器）",
+              f0["next_frame_input_registers"].get("rsp") == 0x1008
+              and "rip" not in f0["next_frame_input_registers"]
+              and f0["caller_pc"] == 0x402000)
+
+        # the same chain capped at 2
+        status, body = chain_post(sg.chain_section(), 2)
+        check("HTTP 连续回溯：帧上限 2 → 2 帧且 frame_limit",
+              status == 200 and body.get("frame_count") == 2
+              and body.get("stop_reason") == "frame_limit")
+
+        # self loop: PC does not advance
+        status, body = chain_post(sg.chain_self_section(), 8)
+        check("HTTP 连续回溯：PC 未推进 → pc_not_advanced，保留 1 帧",
+              status == 200 and body.get("frame_count") == 1
+              and body.get("stop_reason") == "pc_not_advanced"
+              and "PC 未推进" in body.get("stop_detail", ""))
+
+        # A -> B -> A cycle: B recovers the exact input state of A
+        status, body = chain_post(sg.chain_cycle_section(), 16)
+        check("HTTP 连续回溯：循环 → duplicate_state，保留 2 帧",
+              status == 200 and body.get("frame_count") == 2
+              and body.get("stop_reason") == "duplicate_state")
+
+        # later frame unrecoverable caller PC: 422, failing frame, no chain
+        status, body = chain_post(sg.chain_unrecoverable_section(), 8)
+        check("HTTP 连续回溯：后续帧不可恢复 → 422、定位帧 1、无 frames",
+              status == 422 and body.get("frame_index") == 1
+              and body.get("frame_pc") == 0x602000
+              and isinstance(body.get("offset"), int)
+              and "frames" not in body,
+              json.dumps(body, ensure_ascii=False)[:200])
+
+        # later frame malformed opcode: 422 at the reserved opcode offset
+        status, body = chain_post(sg.chain_bad_opcode_section(), 8)
+        check("HTTP 连续回溯：后续帧格式错误 → 422、定位帧 1 与原始偏移",
+              status == 422 and body.get("frame_index") == 1
+              and isinstance(body.get("offset"), int)
+              and "frames" not in body,
+              json.dumps(body, ensure_ascii=False)[:200])
+
+        # later frame memory out of bounds: 422, no partial chain
+        status, body = chain_post(sg.chain_section(), 8,
+                                  mem_override="0x1000=0x402000")
+        check("HTTP 连续回溯：后续帧内存越界 → 422、定位帧 1、无 frames",
+              status == 422 and body.get("frame_index") == 1
+              and "frames" not in body,
+              json.dumps(body, ensure_ascii=False)[:200])
+
+        # chain request whose starting PC misses: 200 hit=false (unchanged)
+        status, body = _request("POST", base + "/api/analyze", {
+            "section_base64": base64.b64encode(
+                sg.chain_section()[0]).decode("ascii"),
+            "pc": "0x409000",
+            "registers_text": "rsp=0x1000",
+            "memory_text": "0x1000=0x1", "max_frames": 8})
+        check("HTTP 连续回溯：起始未命中 → 200 hit=false 无结论字段",
+              status == 200 and body.get("hit") is False
+              and "miss_reason" in body and "frames" not in body)
+
+        # out-of-range frame cap is a 400 client error
+        status, body = chain_post(sg.chain_section(), 17)
+        check("HTTP 连续回溯：帧上限 17 → 400", status == 400, str(body))
+        status, body = chain_post(sg.chain_section(), 1)
+        check("HTTP 连续回溯：帧上限 1 → 400", status == 400, str(body))
+
+        # single-frame requests must keep their exact original schema
+        status, single = _request("POST", base + "/api/analyze", {
+            "section_base64": base64.b64encode(
+                sg.chain_section()[0]).decode("ascii"),
+            "pc": "0x401000", "registers_text": "rsp=0x1000",
+            "memory_text": "0x1000=0x402000"})
+        check("HTTP 单帧请求：无 mode/frames 字段，保持原语义",
+              status == 200 and single.get("hit") is True
+              and "mode" not in single and "frames" not in single
+              and "frame_limit" not in single
+              and single["caller_pc"] == 0x402000)
+
         # unknown route
         status, _ = _request("GET", base + "/nope")
         check("未知路径 → 404", status == 404)
@@ -528,6 +823,7 @@ def main() -> int:
     try:
         test_build()
         test_engine()
+        test_chain_engine()
         test_failures()
         test_http()
     except Exception as exc:  # noqa: BLE001

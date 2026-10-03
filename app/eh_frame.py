@@ -702,6 +702,176 @@ class AnalysisResult:
     miss_reason: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Consecutive backtracing (multi-frame unwind)
+# ---------------------------------------------------------------------------
+
+MIN_CHAIN_FRAMES = 2
+MAX_CHAIN_FRAMES = 16
+
+# Termination reasons for :func:`analyze_chain`.
+CHAIN_STOP_INITIAL_MISS = "initial_miss"        # frame 0 itself hits no FDE
+CHAIN_STOP_CALLER_MISS = "caller_pc_miss"       # normal chain tail
+CHAIN_STOP_PC_NOT_ADVANCED = "pc_not_advanced"
+CHAIN_STOP_DUPLICATE_STATE = "duplicate_state"
+CHAIN_STOP_FRAME_LIMIT = "frame_limit"
+
+
+class ChainError(Exception):
+    """A frame *after frame 0* failed reduction.
+
+    The whole consecutive backtrace is rejected: no partial chain is
+    returned.  ``error`` is the anchored :class:`EHFrameError` of the
+    failing frame (its offset is the first raw section offset), and
+    ``frame_index`` is the zero-based position of the failing frame.
+    """
+
+    def __init__(self, frame_index: int, pc: int, error: "EHFrameError"):
+        super().__init__("连续回溯第 %d 帧（frame_index=%d，0 起始；"
+                         "该帧 PC 0x%x）归约失败：%s"
+                         % (frame_index + 1, frame_index, pc, error.message))
+        self.frame_index = frame_index
+        self.pc = pc
+        self.error = error
+
+
+@dataclass
+class FrameChain:
+    frames: List[AnalysisResult]
+    frame_limit: int
+    stop_reason: str
+    stop_detail: str
+
+
+def recovered_caller_registers(result: AnalysisResult) -> Dict[int, int]:
+    """Collect the caller register values recovered by one frame.
+
+    Only registers with a definite recovered value are included —
+    ``undefined`` rules, non-recoverable ``register`` chains and
+    registers with no rule at all are deliberately absent, because the
+    next frame must be fed *only* values this frame could prove.
+
+    The return-address column is deliberately excluded: its recovered
+    value is the *next frame's PC* (used to select that frame's FDE),
+    not a register the next frame's own reduction may read — feeding it
+    back would let a pathological ``same_value`` return rule read the
+    incoming PC as a recovered value.
+
+    Per the DWARF definition the CFA is the value of the stack pointer
+    at the call site of the caller frame, so the next frame's ``rsp``
+    is intrinsically this frame's CFA — this is how real ``.eh_frame``
+    sections (which carry no explicit rsp rule) chain.  An explicit
+    recovered rsp rule, if present, takes precedence.
+    """
+    out: Dict[int, int] = {}
+    assert result.hit and result.cie is not None
+    for rec in result.registers:
+        if rec.number == result.cie.ra_column:
+            continue
+        if rec.recoverable and rec.value is not None:
+            out[rec.number] = rec.value
+    # DWARF x86-64 register 7 is rsp; the caller-frame rsp equals CFA.
+    if 7 not in out and result.cfa_value is not None:
+        out[7] = result.cfa_value
+    return out
+
+
+def _fde_covers(section: FrameSection, pc: int) -> bool:
+    return any(fde.initial_location <= pc < fde.end_address
+               for fde in section.fdes)
+
+
+def analyze_chain(section: FrameSection, pc: int,
+                  registers: Dict[int, int],
+                  memory: Optional[Dict[int, int]] = None,
+                  max_frames: int = MAX_CHAIN_FRAMES) -> FrameChain:
+    """Consecutively backtrace up to ``max_frames`` frames.
+
+    Frame 0 is reduced by the same rules as :func:`analyze`.  Each
+    later frame receives *only* the register values recovered by the
+    previous frame (the return-address column becoming the next PC) and
+    is reduced against the same section and the same register/memory
+    snapshot.
+
+    The chain stops, keeping every complete frame, when the recovered
+    caller PC hits no FDE (normal tail), when the PC fails to advance,
+    when the same call state repeats, or when the frame cap is reached.
+    A failure in any frame after frame 0 raises :class:`ChainError`
+    with the failing frame index and the anchored raw section offset;
+    no partial chain is produced.
+    """
+    if (not isinstance(max_frames, int) or isinstance(max_frames, bool)
+            or not (MIN_CHAIN_FRAMES <= max_frames <= MAX_CHAIN_FRAMES)):
+        raise ValueError("连续回溯帧上限必须是 %d..%d 之间的整数"
+                         % (MIN_CHAIN_FRAMES, MAX_CHAIN_FRAMES))
+
+    mask = 0xFFFFFFFFFFFFFFFF
+    current_pc = pc & mask
+    current_regs = {n: v & mask for n, v in (registers or {}).items()}
+    frames: List[AnalysisResult] = []
+    # Consumed input states (PC + the exact recovered register set),
+    # used to prove "the same call state repeats" independently of PC
+    # non-progress.
+    seen_states = {(current_pc, frozenset(current_regs.items()))}
+
+    for index in range(max_frames):
+        try:
+            result = analyze(section, current_pc, current_regs, memory)
+        except EHFrameError as exc:
+            if index == 0:
+                raise
+            raise ChainError(index, current_pc, exc)
+
+        if not result.hit:
+            if index == 0:
+                # Identical to the single-frame miss semantics.
+                return FrameChain([], max_frames,
+                                  CHAIN_STOP_INITIAL_MISS, result.miss_reason)
+            # Coverage is pre-checked before each step; defend anyway.
+            return FrameChain(
+                frames, max_frames, CHAIN_STOP_CALLER_MISS,
+                "第 %d 帧的调用者 PC 0x%x 未命中任何 FDE，作为正常链尾终止；"
+                "已保留此前 %d 个完整帧" % (index + 1, current_pc, len(frames)))
+
+        frames.append(result)
+        next_pc = result.caller_pc
+        assert next_pc is not None
+        next_regs = recovered_caller_registers(result)
+        next_state = (next_pc, frozenset(next_regs.items()))
+
+        if next_pc == current_pc:
+            reason = CHAIN_STOP_PC_NOT_ADVANCED
+            detail = ("第 %d 帧恢复出的调用者 PC 0x%x 与该帧当前 PC 相同，"
+                      "PC 未推进，判定回溯无进展而终止；已保留 %d 个完整帧"
+                      % (index + 1, next_pc, len(frames)))
+        elif next_state in seen_states:
+            reason = CHAIN_STOP_DUPLICATE_STATE
+            detail = ("第 %d 帧恢复出的下一调用状态（PC 0x%x 与恢复出的寄存器"
+                      "集合）与此前某帧完全相同，重复落入同一调用状态，判定"
+                      "循环而终止；已保留 %d 个完整帧"
+                      % (index + 1, next_pc, len(frames)))
+        elif not _fde_covers(section, next_pc):
+            reason = CHAIN_STOP_CALLER_MISS
+            detail = ("第 %d 帧恢复出的调用者 PC 0x%x 未落入任何 FDE 的"
+                      "[initial_location, initial_location + "
+                      "address_range) 半开区间，作为正常链尾终止；已保留 "
+                      "%d 个完整帧" % (index + 1, next_pc, len(frames)))
+        elif len(frames) == max_frames:
+            reason = CHAIN_STOP_FRAME_LIMIT
+            detail = ("已达到帧上限 %d（含当前帧），按上限终止；末帧（第 %d "
+                      "帧）调用者 PC = 0x%x 仍可继续回溯但未再归约"
+                      % (max_frames, len(frames), next_pc))
+        else:
+            seen_states.add(next_state)
+            current_pc = next_pc
+            current_regs = next_regs
+            continue
+        return FrameChain(frames, max_frames, reason, detail)
+
+    # Unreachable: the loop always terminates with an explicit reason.
+    raise AssertionError("analyze_chain terminated without a reason")  # pragma: no cover
+
+
 def _build_initial(cie: CIE):
     """Reduce CIE initial instructions into the row-0 state."""
     mach = _Machine(cie, None, cie.initial_instructions_offset, {}, {},

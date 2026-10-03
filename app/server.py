@@ -20,8 +20,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .eh_frame import (
-    EHFrameError, MAX_SECTION_SIZE, analyze, parse_section, reg_name,
-    parse_reg_number,
+    EHFrameError, ChainError, MAX_SECTION_SIZE, analyze, analyze_chain,
+    MIN_CHAIN_FRAMES, MAX_CHAIN_FRAMES, recovered_caller_registers,
+    parse_section, reg_name, parse_reg_number,
 )
 from . import samplegen
 
@@ -82,41 +83,12 @@ def _coerce_int(val) -> int:
     return _parse_int(str(val), "数值")
 
 
-def build_response(payload: dict) -> dict:
-    """Pure transformation: request dict -> response dict (raises)."""
-    raw = _b64_decode(payload.get("section_base64", ""))
-    pc = _parse_int(str(payload.get("pc", "")), "PC")
-    if pc < 0 or pc > 0xFFFFFFFFFFFFFFFF:
-        raise ValueError("PC 必须是 64 位无符号地址（支持 0x 十六进制）")
-
-    regs_in: dict = {}
-    if isinstance(payload.get("registers"), dict):
-        for key, val in payload["registers"].items():
-            regs_in[parse_reg_number(str(key))] = _coerce_int(val)
-    elif isinstance(payload.get("registers_text"), str):
-        for key, val in _parse_kv_lines(payload["registers_text"],
-                                        "寄存器").items():
-            regs_in[parse_reg_number(key)] = _parse_int(val, "寄存器值 %s" % key)
-
-    mem_in: dict = {}
-    if isinstance(payload.get("memory"), dict):
-        for key, val in payload["memory"].items():
-            mem_in[int(str(key), 0)] = _coerce_int(val)
-    elif isinstance(payload.get("memory_text"), str):
-        for key, val in _parse_kv_lines(payload["memory_text"],
-                                        "内存快照").items():
-            mem_in[_parse_int(key, "内存地址")] = _parse_int(val, "内存值")
-
-    section = parse_section(raw)
-    result = analyze(section, pc, regs_in, mem_in)
-
-    if not result.hit:
-        return {"hit": False, "pc": pc, "miss_reason": result.miss_reason}
-
-    fde, cie, row = result.fde, result.cie, result.matched_row
+def _build_hit_body(result) -> dict:
+    """Serialize one reduced, hitting frame (the single-frame schema)."""
+    fde, cie = result.fde, result.cie
     return {
         "hit": True,
-        "pc": pc,
+        "pc": result.pc,
         "fde": {
             "length_field_offset": fde.offset,
             "cie_pointer_field_offset": fde.pointer_field_offset,
@@ -186,6 +158,95 @@ def build_response(payload: dict) -> dict:
     }
 
 
+# Human-readable Chinese labels for the consecutive-backtrace stop
+# reasons; the API also keeps the machine-readable ``code``.
+_CHAIN_STOP_TEXT = {
+    "initial_miss": "起始 PC 未命中任何 FDE",
+    "caller_pc_miss": "调用者 PC 未命中 FDE（正常链尾）",
+    "pc_not_advanced": "PC 未推进",
+    "duplicate_state": "重复落入同一调用状态（循环）",
+    "frame_limit": "达到帧上限",
+}
+
+
+def _build_frame_entry(index: int, result, next_inputs: dict) -> dict:
+    """One frame of a consecutive backtrace response."""
+    body = _build_hit_body(result)
+    body["frame_index"] = index
+    # Exactly the registers this frame recovered and fed to the next
+    # frame (return-address column included, mapped to the caller PC).
+    body["next_frame_input_registers"] = {
+        reg_name(num): val for num, val in sorted(next_inputs.items())}
+    return body
+
+
+def _build_chain_body(pc: int, chain) -> dict:
+    frames = []
+    for index, result in enumerate(chain.frames):
+        frames.append(_build_frame_entry(
+            index, result, recovered_caller_registers(result)))
+    return {
+        "mode": "chain",
+        "pc": pc,
+        "frame_limit": chain.frame_limit,
+        "frame_count": len(frames),
+        "stop_reason": chain.stop_reason,
+        "stop_reason_text": _CHAIN_STOP_TEXT[chain.stop_reason],
+        "stop_detail": chain.stop_detail,
+        "frames": frames,
+    }
+
+
+def build_response(payload: dict) -> dict:
+    """Pure transformation: request dict -> response dict (raises)."""
+    raw = _b64_decode(payload.get("section_base64", ""))
+    pc = _parse_int(str(payload.get("pc", "")), "PC")
+    if pc < 0 or pc > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("PC 必须是 64 位无符号地址（支持 0x 十六进制）")
+
+    regs_in: dict = {}
+    if isinstance(payload.get("registers"), dict):
+        for key, val in payload["registers"].items():
+            regs_in[parse_reg_number(str(key))] = _coerce_int(val)
+    elif isinstance(payload.get("registers_text"), str):
+        for key, val in _parse_kv_lines(payload["registers_text"],
+                                        "寄存器").items():
+            regs_in[parse_reg_number(key)] = _parse_int(val, "寄存器值 %s" % key)
+
+    mem_in: dict = {}
+    if isinstance(payload.get("memory"), dict):
+        for key, val in payload["memory"].items():
+            mem_in[int(str(key), 0)] = _coerce_int(val)
+    elif isinstance(payload.get("memory_text"), str):
+        for key, val in _parse_kv_lines(payload["memory_text"],
+                                        "内存快照").items():
+            mem_in[_parse_int(key, "内存地址")] = _parse_int(val, "内存值")
+
+    section = parse_section(raw)
+
+    max_frames = payload.get("max_frames")
+    if max_frames is None or str(max_frames).strip() == "":
+        # Original single-frame request: semantics and schema unchanged.
+        result = analyze(section, pc, regs_in, mem_in)
+        if not result.hit:
+            return {"hit": False, "pc": pc, "miss_reason": result.miss_reason}
+        return _build_hit_body(result)
+
+    try:
+        max_frames = int(str(max_frames).strip(), 0)
+    except ValueError:
+        raise ValueError("连续回溯帧上限必须是整数（%d..%d）"
+                         % (MIN_CHAIN_FRAMES, MAX_CHAIN_FRAMES))
+    if not (MIN_CHAIN_FRAMES <= max_frames <= MAX_CHAIN_FRAMES):
+        raise ValueError("连续回溯帧上限必须在 %d..%d 之间，得到 %d"
+                         % (MIN_CHAIN_FRAMES, MAX_CHAIN_FRAMES, max_frames))
+
+    chain = analyze_chain(section, pc, regs_in, mem_in, max_frames)
+    if chain.stop_reason == "initial_miss":
+        return {"hit": False, "pc": pc, "miss_reason": chain.stop_detail}
+    return _build_chain_body(pc, chain)
+
+
 # ---------------------------------------------------------------------------
 # Demo sample
 # ---------------------------------------------------------------------------
@@ -198,6 +259,17 @@ def static_sample_payload() -> dict:
         "pc": hex(inputs["pc_rewritten"]),
         "registers_text": inputs["registers_text"],
         "memory_text": inputs["memory_text"],
+    }
+
+
+def chain_sample_payload() -> dict:
+    data, inputs = samplegen.chain_section()
+    return {
+        "section_base64": base64.b64encode(data).decode("ascii"),
+        "pc": hex(inputs["pc"]),
+        "registers_text": inputs["registers_text"],
+        "memory_text": inputs["memory_text"],
+        "max_frames": 8,
     }
 
 
@@ -241,6 +313,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/static_sample":
             self._send_json(200, static_sample_payload())
             return
+        if path == "/chain_sample":
+            self._send_json(200, chain_sample_payload())
+            return
         self._send_json(404, {"error": "not found", "path": path})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -265,6 +340,16 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             response = build_response(payload)
+        except ChainError as exc:
+            # A later frame failed: the whole consecutive backtrace is
+            # rejected — no frames array, no partial chain.  The offset
+            # is the failing frame's first raw section offset.
+            self._send_json(422, {
+                "error": str(exc),
+                "frame_index": exc.frame_index,
+                "frame_pc": exc.pc,
+                "offset": exc.error.offset})
+            return
         except EHFrameError as exc:
             # Anchor the first raw section offset; never partial output.
             self._send_json(422, {"error": exc.message,

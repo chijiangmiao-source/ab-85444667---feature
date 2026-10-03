@@ -71,7 +71,28 @@
   .errbox{font-family:var(--mono);white-space:pre-wrap}
   code{background:#0c111c;border:1px solid var(--line);border-radius:4px;
     padding:0 4px}
-  #result[hidden]{display:none}
+  #result[hidden],#chain-result[hidden]{display:none}
+  .checkline{display:flex;align-items:center;gap:7px;color:var(--text);
+    font-size:12.5px;white-space:nowrap;margin:0;cursor:pointer}
+  .frame-block{border:1px solid var(--line);border-radius:10px;
+    padding:4px 14px 14px;margin-bottom:16px;background:rgba(29,39,64,.35)}
+  .frame-block > h3{font-size:13px;color:var(--accent);margin:12px 0 4px;
+    display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .frame-block h3 .fi{background:var(--panel2);border:1px solid var(--line);
+    border-radius:6px;padding:1px 8px;font-size:11.5px}
+  .frame-block .card{background:transparent;border:0;border-radius:0;
+    padding:8px 0;margin:0}
+  .frame-block .card h2{margin-bottom:6px}
+  .chain-summary .kv{grid-template-columns:150px 1fr}
+  .stopbadge{display:inline-block;padding:2px 9px;border-radius:20px;
+    font-size:11.5px;font-weight:700}
+  .s-tail{background:rgba(61,220,132,.18);color:var(--ok)}
+  .s-loop{background:rgba(255,180,84,.18);color:var(--warn)}
+  .s-limit{background:rgba(90,169,255,.18);color:var(--accent)}
+  .next-input{font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    margin-top:6px;word-break:break-all}
+  .chain-arrow{text-align:center;color:var(--accent);font-size:15px;
+    margin:-8px 0 8px}
 </style>
 </head>
 <body>
@@ -109,8 +130,22 @@ r12=0x222</textarea>
 0x7fffe8=0x333
 0x7fffe0=0x444</textarea>
       <div class="hint">CFA 计算或 offset 恢复若读取未提供的地址，将按越界报错且不返回任何寄存器结果。</div>
+      <div class="row" style="align-items:flex-end;margin-top:10px">
+        <div style="flex:0 0 auto">
+          <label class="checkline"><input type="checkbox" id="chain">
+            连续回溯（逐帧回溯调用者）</label>
+        </div>
+        <div style="max-width:220px">
+          <label for="maxframes">帧上限（2–16，含当前帧）</label>
+          <input type="text" id="maxframes" value="8" disabled>
+        </div>
+      </div>
+      <div class="hint" id="chain-hint" hidden>系统先按既有规则归约当前帧，再仅以该帧恢复出的寄存器
+        （含作为 CFA 的调用者 rsp）与调用者 PC 作为下一帧输入；同一份
+        .eh_frame、寄存器与内存快照逐帧归约。</div>
       <button id="go">分析 / Analyze</button>
-      <button id="sample" class="secondary">载入示例（含 remember/restore）</button>
+      <button id="sample" class="secondary">载入单帧示例（含 remember/restore）</button>
+      <button id="chain-sample" class="secondary">载入连续回溯示例</button>
       <button id="clear" class="secondary">清空结论</button>
     </div>
   </section>
@@ -120,41 +155,14 @@ r12=0x222</textarea>
     <div id="st-miss" class="status miss"></div>
     <div id="st-err" class="status err"></div>
 
-    <div id="result" hidden>
-      <div class="card">
-        <h2>命中结论</h2>
-        <dl class="kv" id="kv-hit"></dl>
+    <div id="result" hidden></div>
+
+    <div id="chain-result" hidden>
+      <div class="card chain-summary">
+        <h2>连续回溯总览</h2>
+        <div id="kv-chain"></div>
       </div>
-      <div class="card">
-        <h2>关联 CIE</h2>
-        <dl class="kv" id="kv-cie"></dl>
-      </div>
-      <div class="card">
-        <h2>CFA 与调用者 PC</h2>
-        <dl class="kv" id="kv-cfa"></dl>
-      </div>
-      <div class="card">
-        <h2>寄存器恢复规则与取值</h2>
-        <table>
-          <thead><tr><th>寄存器</th><th>规则</th><th>规则来源偏移</th>
-            <th>恢复值</th><th>说明</th></tr></thead>
-          <tbody id="reg-body"></tbody>
-        </table>
-        <details>
-          <summary>内存读取记录（CFA 相对，禁止越界）</summary>
-          <table><thead><tr><th>地址</th><th>8 字节值</th></tr></thead>
-          <tbody id="mem-body"></tbody></table>
-        </details>
-      </div>
-      <div class="card">
-        <h2>逐地址规则归约时间线</h2>
-        <div class="timeline-wrap">
-        <table>
-          <thead><tr><th>FDE 相对位置</th><th>CFA</th><th>寄存器规则</th></tr></thead>
-          <tbody id="tl-body"></tbody>
-        </table>
-        </div>
-      </div>
+      <div id="chain-frames"></div>
     </div>
 
     <div id="errorbox" class="card" hidden>
@@ -176,30 +184,39 @@ function setStatus(kind, msg){
   if(kind){ const el=$("st-"+kind); el.textContent=msg; el.classList.add("show"); }
 }
 function clearResult(){
-  $("result").hidden = true; $("errorbox").hidden = true;
+  $("result").hidden = true; $("result").innerHTML="";
+  $("chain-result").hidden = true; $("chain-frames").innerHTML="";
+  $("errorbox").hidden = true;
   setStatus(null,"");
 }
 
-function kv(dl, pairs){
-  dl.innerHTML="";
+function el(tag, cls, text){
+  const e=document.createElement(tag);
+  if(cls) e.className=cls;
+  if(text!=null) e.textContent=text;
+  return e;
+}
+function kvDl(pairs){
+  const dl=el("dl","kv");
   for(const [k,v] of pairs){
-    const dt=document.createElement("dt"); dt.textContent=k;
-    const dd=document.createElement("dd"); dd.innerHTML=v;
-    dl.appendChild(dt); dl.appendChild(dd);
+    dl.appendChild(el("dt",null,k));
+    const dd=el("dd"); dd.innerHTML=v;
+    dl.appendChild(dd);
   }
+  return dl;
+}
+function card(title, node){
+  const c=el("div","card");
+  c.appendChild(el("h2",null,title));
+  c.appendChild(node);
+  return c;
 }
 
-function render(data){
-  clearResult();
-  if(!data.hit){
-    setStatus("miss","未命中：" + data.miss_reason);
-    return; // 明确未命中，且页面不保留任何上次结论
-  }
-  setStatus("ok", "命中 FDE @ raw 0x"+data.fde.length_field_offset.toString(16)+
-    "，PC "+hex(data.pc)+" ∈ ["+hex(data.hit_range[0])+", "+hex(data.hit_range[1])+")");
-
+// Build the five evidence cards for one reduced, hitting frame.
+function frameCards(data){
+  const frag=document.createDocumentFragment();
   const f=data.fde, c=data.cie;
-  kv($("kv-hit"), [
+  frag.appendChild(card("命中结论", kvDl([
     ["当前 PC", hex(data.pc)],
     ["FDE 长度字段偏移", hex(f.length_field_offset)],
     ["CIE 指针字段偏移", hex(f.cie_pointer_field_offset)],
@@ -208,15 +225,15 @@ function render(data){
     ["命中行 FDE 相对位置", hex(data.matched_row.fde_relative_location)],
     ["命中行绝对起始", hex(data.matched_row.absolute_location_start)],
     ["FDE 指令起始偏移", hex(f.instructions_offset)],
-  ]);
-  kv($("kv-cie"), [
+  ])));
+  frag.appendChild(card("关联 CIE", kvDl([
     ["CIE 偏移 / 版本", hex(c.length_field_offset)+" / v"+c.version],
     ["增强字符串", JSON.stringify(c.augmentation)],
     ["code / data align", c.code_alignment_factor+" / "+c.data_alignment_factor],
     ["返回地址列", c.return_address_column+" ("+c.return_address_register+")"],
     ["CIE 初始指令偏移", hex(c.initial_instructions_offset)],
-  ]);
-  kv($("kv-cfa"), [
+  ])));
+  frag.appendChild(card("CFA 与调用者 PC", kvDl([
     ["CFA 规则", data.cfa.rule],
     ["CFA 取值", hex(data.cfa.value)],
     ["CFA 推导", data.cfa.reason],
@@ -226,12 +243,12 @@ function render(data){
         : hex(data.caller_pc)],
     ["返回地址规则", data.caller_pc_rule],
     ["调用者 PC 推导", data.caller_pc_reason],
-  ]);
+  ])));
 
-  const rb=$("reg-body"); rb.innerHTML="";
+  const rb=el("tbody");
   for(const r of data.registers){
-    const tr=document.createElement("tr");
-    let badge = r.rule_kind==="undefined"
+    const tr=el("tr");
+    const badge = r.rule_kind==="undefined"
       ? "<span class='badge b-und'>undefined</span>"
       : (r.recoverable ? "<span class='badge b-ok'>可恢复</span>"
                        : "<span class='badge b-no'>不可恢复</span>");
@@ -243,15 +260,31 @@ function render(data){
       "<td>"+r.reason+"</td>";
     rb.appendChild(tr);
   }
-  const mb=$("mem-body"); mb.innerHTML="";
+  const regTable=el("table");
+  regTable.innerHTML="<thead><tr><th>寄存器</th><th>规则</th><th>规则来源偏移</th>"+
+    "<th>恢复值</th><th>说明</th></tr></thead>";
+  regTable.appendChild(rb);
+  const regWrap=el("div");
+  regWrap.appendChild(regTable);
+
+  const mb=el("tbody");
   for(const m of data.memory_reads){
-    const tr=document.createElement("tr");
+    const tr=el("tr");
     tr.innerHTML="<td class='num'>"+hex(m.address)+"</td><td class='num'>"+hex(m.value)+"</td>";
     mb.appendChild(tr);
   }
-  const tb=$("tl-body"); tb.innerHTML="";
-  data.timeline.forEach((row,i)=>{
-    const tr=document.createElement("tr");
+  const memDet=el("details");
+  const memSummary=el("summary",null,"内存读取记录（CFA 相对，禁止越界）");
+  const memTable=el("table");
+  memTable.innerHTML="<thead><tr><th>地址</th><th>8 字节值</th></tr></thead>";
+  memTable.appendChild(mb);
+  memDet.appendChild(memSummary); memDet.appendChild(memTable);
+  regWrap.appendChild(memDet);
+  frag.appendChild(card("寄存器恢复规则与取值", regWrap));
+
+  const tb=el("tbody");
+  data.timeline.forEach(row=>{
+    const tr=el("tr");
     const regs=(row.regs||[]).map(v=>{
       const extra = v.kind==="offset"
         ? " → [CFA"+(v.byte_offset>=0?"+":"")+v.byte_offset+"]"
@@ -266,7 +299,77 @@ function render(data){
     if(hl) tr.style.outline="1px solid var(--accent)";
     tb.appendChild(tr);
   });
-  $("result").hidden=false;
+  const tlTable=el("table");
+  tlTable.innerHTML="<thead><tr><th>FDE 相对位置</th><th>CFA</th><th>寄存器规则</th></tr></thead>";
+  tlTable.appendChild(tb);
+  const tlWrap=el("div","timeline-wrap");
+  tlWrap.appendChild(tlTable);
+  frag.appendChild(card("逐地址规则归约时间线", tlWrap));
+  return frag;
+}
+
+// --- single-frame rendering (original semantics) ---
+function render(data){
+  clearResult();
+  setStatus("ok", "命中 FDE @ raw 0x"+data.fde.length_field_offset.toString(16)+
+    "，PC "+hex(data.pc)+" ∈ ["+hex(data.hit_range[0])+", "+hex(data.hit_range[1])+")");
+  const box=$("result");
+  box.appendChild(frameCards(data));
+  box.hidden=false;
+}
+
+const STOP_BADGE={
+  caller_pc_miss:["s-tail","正常链尾：调用者 PC 未命中 FDE"],
+  pc_not_advanced:["s-loop","终止：PC 未推进"],
+  duplicate_state:["s-loop","终止：重复落入同一调用状态（循环）"],
+  frame_limit:["s-limit","终止：达到帧上限"],
+};
+
+// --- consecutive-backtrace rendering ---
+function renderChain(data){
+  clearResult();
+  const [cls,label]=STOP_BADGE[data.stop_reason]||
+    ["s-limit","终止："+(data.stop_reason_text||data.stop_reason)];
+  setStatus("ok", "连续回溯完成：共 "+data.frame_count+" 帧（上限 "+
+    data.frame_limit+"），"+label);
+
+  const list=data.frames.map(f=>{
+    const a=hex(f.pc), b=hex(f.caller_pc);
+    return "帧"+f.frame_index+"："+a+" → "+b;
+  }).join("　");
+  const kv=$("kv-chain"); kv.innerHTML="";
+  kv.appendChild(kvDl([
+    ["起始 PC", hex(data.pc)],
+    ["帧上限 / 实际帧数", data.frame_limit+" / "+data.frame_count],
+    ["终止原因", "<span class='stopbadge "+cls+"'>"+
+      (data.stop_reason_text||data.stop_reason)+"</span>"],
+    ["终止说明", data.stop_detail],
+    ["逐帧 PC 链", list],
+  ]));
+
+  const host=$("chain-frames");
+  data.frames.forEach((f,i)=>{
+    const block=el("div","frame-block");
+    const h=el("h3");
+    h.innerHTML="<span class='fi'>帧 "+f.frame_index+"</span>"+
+      "当前 PC "+hex(f.pc)+" → 调用者 PC "+hex(f.caller_pc)+
+      " <span style='color:var(--muted);font-weight:400;font-size:11.5px'>"+
+      "FDE@"+hex(f.fde.length_field_offset)+" · CFA="+hex(f.cfa.value)+
+      "</span>";
+    block.appendChild(h);
+    block.appendChild(frameCards(f));
+    const ni=f.next_frame_input_registers||{};
+    const keys=Object.keys(ni);
+    if(keys.length){
+      block.appendChild(el("div","next-input",
+        "下一帧输入（仅本帧恢复出的寄存器）："+
+        keys.map(k=>k+"="+hex(ni[k])).join("，")));
+    }
+    host.appendChild(block);
+    if(i<data.frames.length-1)
+      host.appendChild(el("div","chain-arrow","▼ 以本帧恢复寄存器与调用者 PC 继续归约 ▼"));
+  });
+  $("chain-result").hidden=false;
 }
 
 async function analyze(){
@@ -276,6 +379,8 @@ async function analyze(){
     registers_text:$("regs").value,
     memory_text:$("mem").value,
   };
+  if($("chain").checked)
+    payload.max_frames=$("maxframes").value.trim();
   setStatus(null,"");
   let resp;
   try{
@@ -287,28 +392,57 @@ async function analyze(){
     $("errtext").textContent="网络错误："+e; setStatus("err","请求失败"); return;
   }
   let data; try{ data=await resp.json(); }catch(e){ data={error:"非 JSON 响应"}; }
-  if(resp.ok){ render(data); return; }
+  if(resp.ok){
+    if(data.mode==="chain"){ renderChain(data); return; }
+    if(!data.hit){
+      clearResult();
+      setStatus("miss","未命中：" + data.miss_reason);
+      return; // 明确未命中，且页面不保留任何上次结论
+    }
+    render(data);
+    return;
+  }
   clearResult();
   $("errorbox").hidden=false;
-  $("errtext").textContent = data.error +
-    (data.offset!=null ? "\n首个原始偏移：0x"+data.offset.toString(16)+
-      " ("+data.offset+")" : "");
+  let text=data.error||"";
+  if(data.frame_index!=null){
+    text+="\n失败帧：连续回溯第 "+data.frame_index+" 帧（该帧 PC "+
+      hex(data.frame_pc)+"）；任一后续帧失败时整条连续回溯不返回任何帧。";
+  }
+  if(data.offset!=null)
+    text+="\n首个原始节偏移：0x"+data.offset.toString(16)+" ("+data.offset+")";
+  $("errtext").textContent=text;
   if(resp.status===422) setStatus("err","解析/归约被拒绝（422）");
   else setStatus("err","请求错误（"+resp.status+"）");
 }
 
-// --- bundled example: built by /api/sample is unnecessary; embed one ---
 async function loadSample(){
   const r = await fetch("/static_sample").catch(()=>null);
   if(r && r.ok){ const s=await r.json();
     $("section").value=s.section_base64; $("pc").value=s.pc;
     $("regs").value=s.registers_text; $("mem").value=s.memory_text;
+    $("chain").checked=false; $("chain").dispatchEvent(new Event("change"));
+  }
+}
+async function loadChainSample(){
+  const r = await fetch("/chain_sample").catch(()=>null);
+  if(r && r.ok){ const s=await r.json();
+    $("section").value=s.section_base64; $("pc").value=s.pc;
+    $("regs").value=s.registers_text; $("mem").value=s.memory_text;
+    $("maxframes").value=String(s.max_frames||8);
+    $("chain").checked=true; $("chain").dispatchEvent(new Event("change"));
   }
 }
 
 $("go").onclick=analyze;
 $("clear").onclick=clearResult;
 $("sample").onclick=loadSample;
+$("chain-sample").onclick=loadChainSample;
+$("chain").onchange=()=>{
+  const on=$("chain").checked;
+  $("maxframes").disabled=!on;
+  $("chain-hint").hidden=!on;
+};
 
 fetch("/healthz").then(r=>r.json()).then(j=>{
   $("health").textContent="健康检查："+j.status;

@@ -225,3 +225,111 @@ def all_failure_sections() -> List[Tuple[str, bytes]]:
         ("stack_underflow", stack_underflow_section()),
         ("unsupported_version", unsupported_version_section()),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Consecutive-backtrace fixtures
+#
+# Every chained FDE uses the standard x86-64 pattern the analyzer models:
+# the caller's rsp equals the current CFA, and the return address is an
+# offset slot relative to it.
+# ---------------------------------------------------------------------------
+
+
+def _std_cie(extra_init: bytes = b"") -> bytes:
+    """CIE: CFA=rsp+8; rip=[CFA-8] (+optional initial rules).
+
+    No explicit rsp rule: real .eh_frame chains rely on the next
+    frame's rsp equalling the current CFA, which the backtracer
+    supplies intrinsically.
+    """
+    init = (bytes([DEF_CFA]) + uleb(RSP) + uleb(8)
+            + bytes([0x80 | RIP]) + uleb(1) + extra_init)
+    return cie(init)
+
+
+def chain_section() -> Tuple[bytes, dict]:
+    """Three covered frames; frame 2's caller PC hits no FDE (normal tail).
+
+    Frame 0: PC 0x401000, rsp=0x1000 -> CFA 0x1008, [0x1000]=0x402000
+    Frame 1: PC 0x402000, rsp=0x1008 -> CFA 0x1010, [0x1008]=0x403000
+    Frame 2: PC 0x403000, rsp=0x1010 -> CFA 0x1018, [0x1010]=0x404000
+             (0x404000 is outside every FDE range -> normal chain tail)
+    """
+    c = _std_cie()
+    data = c + fde(0, 0x401000, 0x20, b"") \
+        + fde(0, 0x402000, 0x20, b"") \
+        + fde(0, 0x403000, 0x20, b"")
+    inputs = {
+        "pc": 0x401000,
+        "registers_text": "rsp=0x1000",
+        "memory_text": (
+            "0x1000=0x402000\n"
+            "0x1008=0x403000\n"
+            "0x1010=0x404000\n"),
+    }
+    return data, inputs
+
+
+def chain_self_section() -> Tuple[bytes, dict]:
+    """One covered frame whose recovered caller PC equals its own PC."""
+    data = _std_cie() + fde(0, 0x701000, 0x20, b"")
+    inputs = {
+        "pc": 0x701000,
+        "registers_text": "rsp=0x1000",
+        # CFA=0x1008; rip slot [0x1000] points back at the same PC.
+        "memory_text": "0x1000=0x701000\n",
+    }
+    return data, inputs
+
+
+def chain_cycle_section() -> Tuple[bytes, dict]:
+    """Two FDEs that bounce between each other with a stable CFA.
+
+    Both frames keep CFA=rsp+0 (stable recovered rsp).  A reads its
+    return slot at [CFA-8] and lands in B; B rewrites rip to factor 2
+    ([CFA-16]) and lands back in A with the identical recovered state,
+    so the walk terminates on a repeated call state rather than by
+    walking off the memory snapshot.
+    """
+    init = (bytes([DEF_CFA]) + uleb(RSP) + uleb(0)
+            + bytes([0x80 | RIP]) + uleb(1))
+    data = cie(init)
+    data += fde(0, 0x501000, 0x10, b"")
+    data += fde(0, 0x502000, 0x10,
+                bytes([0x80 | RIP]) + uleb(2))  # rip=[CFA-16]
+    inputs = {
+        "pc": 0x501000,
+        "registers_text": "rsp=0x1000",
+        "memory_text": "0xff8=0x502000\n0xff0=0x501000\n",
+    }
+    return data, inputs
+
+
+def chain_unrecoverable_section() -> Tuple[bytes, dict]:
+    """Frame 0 is fine; frame 1 lands in an FDE with rip undefined."""
+    data = _std_cie()
+    data += fde(0, 0x601000, 0x10, b"")
+    # The loc-0 row (rules before the first advance amend row 0) marks
+    # the return-address column undefined -> caller PC unrecoverable.
+    data += fde(0, 0x602000, 0x10,
+                bytes([UNDEF]) + uleb(RIP))
+    inputs = {
+        "pc": 0x601000,
+        "registers_text": "rsp=0x1000",
+        "memory_text": "0x1000=0x602000\n",
+    }
+    return data, inputs
+
+
+def chain_bad_opcode_section() -> Tuple[bytes, dict]:
+    """Frame 0 is fine; frame 1 hits an FDE with a reserved CFI opcode."""
+    data = _std_cie()
+    data += fde(0, 0x801000, 0x10, b"")
+    data += fde(0, 0x802000, 0x10, bytes([0x0F]))  # reserved opcode
+    inputs = {
+        "pc": 0x801000,
+        "registers_text": "rsp=0x1000",
+        "memory_text": "0x1000=0x802000\n",
+    }
+    return data, inputs
